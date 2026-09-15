@@ -1126,7 +1126,13 @@ def plot_aligned_domains(
             plt.savefig(
                 save_dir / f"{domain_this}_detections_{execution_timestamp}.png"
             )
-            plt.show()
+            # `plt.show()` here would block indefinitely under any
+            # interactive matplotlib backend (Qt/Tk/GTK — often the
+            # default when ``$DISPLAY`` is set over SSH X-forwarding),
+            # and there is no user to close the figure in a CLI run.
+            # Close the figure instead — releases memory and never
+            # blocks regardless of backend.
+            plt.close()
 
 
 def detect_domains_roughly(
@@ -1274,23 +1280,77 @@ def get_all_confidence_values(sequence_id: str) -> list[float]:
     return list(bf.values())
 
 
+def _confident_residues_worker(
+    args: tuple[str, int],
+) -> tuple[str, set[int], bool]:
+    """Pool worker: return ``(sequence_id, confident_residues, used_fallback)``.
+
+    Runs in a spawn-pool worker with its own fresh PyMOL — never touches
+    the parent's PyMOL session. Applies the same fallback used by the
+    serial path: if fewer than 60 % of residues clear the confidence
+    threshold, take the top 80 % most confident ones instead. The
+    ``used_fallback`` flag lets the parent emit the same log line the
+    serial path used to emit.
+    """
+    sequence_id, min_full_length = args
+    bf = _first_atom_bfactors(sequence_id)
+    conf = {r for r, b in bf.items() if b >= 70}
+    used_fallback = len(conf) < 0.6 * min_full_length
+    if used_fallback:
+        vals = list(bf.values())
+        cutoff = float(np.percentile(vals, 20))
+        conf = {r for r, b in bf.items() if b >= cutoff}
+    return sequence_id, conf, used_fallback
+
+
 def get_confident_residue_mappings(
     filename_2_known_regions_completed: dict[str, list[MappedRegion]],
     file_2_all_residues: dict[str, set[str]],
     domain_2_threshold: dict[str, dict[str, int]],
 ) -> dict[str, list[MappedRegion]]:
+    # Route through the active pool service when available: keeps the
+    # PyMOL work off the parent process (whose C selection engine
+    # otherwise races the pool's background result-reader thread, causing
+    # an intermittent deadlock at this step). Falls back to a serial
+    # in-parent-PyMOL loop only when no pool session is open.
+    filenames = list(filename_2_known_regions_completed.keys())
+    conf_residues_by_file: dict[str, set[int]] = {}
+    fallback_files: set[str] = set()
+    if filenames:
+        try:
+            svc = require_active_service()
+        except RuntimeError:
+            svc = None
+        payload = [
+            (filename, len(file_2_all_residues[filename]))
+            for filename in filenames
+        ]
+        if svc is not None:
+            for filename, conf, used_fallback in tqdm(
+                svc.imap_unordered(_confident_residues_worker, payload, chunksize=1),
+                total=len(payload),
+                desc="Filtering confident residues",
+            ):
+                conf_residues_by_file[filename] = conf
+                if used_fallback:
+                    fallback_files.add(filename)
+        else:
+            for filename, min_full_length in tqdm(
+                payload, desc="Filtering confident residues"
+            ):
+                _, conf, used_fallback = _confident_residues_worker(
+                    (filename, min_full_length)
+                )
+                conf_residues_by_file[filename] = conf
+                if used_fallback:
+                    fallback_files.add(filename)
+
     filename_2_known_regions_completed_confident = {}
-    for filename, regions in tqdm(
-        filename_2_known_regions_completed.items(), desc="Filtering confident residues"
-    ):
-        conf_residues = get_confident_af_residues(filename)
-        if len(conf_residues) < 0.6 * len(file_2_all_residues[filename]):
+    for filename, regions in filename_2_known_regions_completed.items():
+        conf_residues = conf_residues_by_file.get(filename, set())
+        if filename in fallback_files:
             logger.warning(
                 f"Too few confident residues for {filename}, leaving top-80% most confident residues"
-            )
-            all_confidence_values = get_all_confidence_values(filename)
-            conf_residues = get_confident_af_residues(
-                filename, np.percentile(all_confidence_values, 20)
             )
         new_regions = []
         for mapped_region_init in regions:

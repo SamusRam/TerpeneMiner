@@ -42,6 +42,48 @@ if len(_sys_bootstrap.argv) >= 2 and _sys_bootstrap.argv[1] in (
         ):
             _os_bootstrap.environ.setdefault(_omp_var, "1")
 
+    # --- matplotlib backend guard ---------------------------------------
+    # ``run_domain_detection`` calls ``plot_aligned_domains`` which
+    # uses ``matplotlib.pyplot``. Any interactive backend (Qt5Agg /
+    # TkAgg / GTK3Agg — selected automatically when ``$DISPLAY`` is set,
+    # e.g. under SSH X-forwarding) opens a figure window and blocks the
+    # pipeline until the user closes it — an intermittent hang from a
+    # CLI's perspective. Force headless Agg for the two structure-
+    # pipeline subcommands unless the user has explicitly overridden it.
+    _os_bootstrap.environ.setdefault("MPLBACKEND", "Agg")
+
+# --- Terminal-state guard --------------------------------------------
+# PyMOL's C init disables terminal ECHO / ICANON on import (its
+# internal readline setup calls ``tcsetattr`` and never restores the
+# original attrs on exit — its atexit relies on the Python interpreter
+# tearing down the tty, which does not happen for a stdin that is a
+# controlling tty inherited from a parent shell). Result: after
+# ``enzyme_explorer_main predict`` returns, the user's shell prompt no
+# longer echoes typed characters even though Enter still submits the
+# invisible command. Snapshot the attrs before PyMOL is ever imported
+# and restore them on interpreter exit — cheap, no-op when stdin isn't
+# a tty, and covers both normal and exception exits.
+try:
+    import atexit as _atexit_bootstrap
+    import termios as _termios_bootstrap
+
+    _TTY_FD = _sys_bootstrap.stdin.fileno()
+    _TTY_ATTRS = _termios_bootstrap.tcgetattr(_TTY_FD)
+
+    def _restore_tty_bootstrap() -> None:
+        try:
+            _termios_bootstrap.tcsetattr(
+                _TTY_FD, _termios_bootstrap.TCSADRAIN, _TTY_ATTRS,
+            )
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    _atexit_bootstrap.register(_restore_tty_bootstrap)
+except Exception:  # pylint: disable=broad-except
+    # stdin is not a tty (piped, redirected, sub-process) — nothing to
+    # save / restore; skip silently.
+    pass
+
 _CONDA_PREFIX = _os_bootstrap.environ.get("CONDA_PREFIX")
 _ALREADY_REEXECED = _os_bootstrap.environ.get("_ENZYME_EXPLORER_LDFIX") == "1"
 if _CONDA_PREFIX and not _ALREADY_REEXECED:
